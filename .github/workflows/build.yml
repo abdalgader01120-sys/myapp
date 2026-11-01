@@ -1,35 +1,496 @@
-name: Build Kivy APK
+name: Build Go Proxy APK
 on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          python-version: '3.9'
+          go-version: '1.21'
 
-      - name: Install system dependencies
+      - name: Create Project Structure
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          mkdir -p app/src/main/java/com/jaddo/proxy
+          mkdir -p app/src/main/assets
+          mkdir -p go_proxy
+          
+      - name: Write Go Proxy Code
+        run: |
+          cat > go_proxy/main.go << 'EOF'
+          package main
 
-      - name: Install Buildozer and jnius
-        run: |
-          pip install --user buildozer
-          pip install --user "jnius>=1.4.0"
+          import (
+          	"bufio"
+          	"crypto/rand"
+          	"crypto/rsa"
+          	"crypto/tls"
+          	"crypto/x509"
+          	"crypto/x509/pkix"
+          	"encoding/pem"
+          	"fmt"
+          	"io"
+          	"math/big"
+          	"net"
+          	"os"
+          	"strings"
+          	"sync"
+          	"time"
+          )
 
-      - name: Build APK with Buildozer
+          const (
+          	listenAddr = "127.0.0.1:8444"
+          	caCertFile = "cert.pem"
+          	caKeyFile  = "key.pem"
+          )
+
+          var targetDomains = []string{
+          	"whatsapp.com", "whatsapp.net", "wa.me", "fbcdn.net",
+          	"facebook.com", "fb.com", "fb.me", "facebook.net", "fbsbx.com",
+          	"instagram.com", "cdninstagram.com", "meta.com", "meta.ai",
+          	"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
+          	"youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
+          }
+
+          var whatsappIPs = []string{"57.144.69.32", "57.144.121.32", "102.132.97.54"}
+
+          var caCert *x509.Certificate
+          var caKey *rsa.PrivateKey
+
+          var certCache = make(map[string]*tls.Certificate)
+          var certMutex sync.Mutex
+
+          func isTarget(host string) bool {
+          	host = strings.ToLower(strings.TrimSuffix(host, "."))
+          	for _, d := range targetDomains {
+          		if host == d || strings.HasSuffix(host, "."+d) {
+          			return true
+          		}
+          	}
+          	return false
+          }
+
+          func loadOrGenerateCA() error {
+          	if _, err := os.Stat(caCertFile); os.IsNotExist(err) {
+          		fmt.Println("[*] Generating new CA Certificate...")
+          		priv, err := rsa.GenerateKey(rand.Reader, 2048)
+          		if err != nil { return err }
+          		caKey = priv
+
+          		serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+          		serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+          		if err != nil { return err }
+
+          		template := x509.Certificate{
+          			SerialNumber: serialNumber,
+          			Subject: pkix.Name{ CommonName: "Jaddo Go Proxy CA" },
+          			NotBefore: time.Now(),
+          			NotAfter: time.Now().Add(3650 * 24 * time.Hour),
+          			KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+          			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+          			BasicConstraintsValid: true,
+          			IsCA: true,
+          		}
+
+          		caCertBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+          		if err != nil { return err }
+
+          		certOut, _ := os.Create(caCertFile)
+          		pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: caCertBytes})
+          		certOut.Close()
+
+          		keyOut, _ := os.Create(caKeyFile)
+          		pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+          		keyOut.Close()
+          		fmt.Println("[+] CA generated:", caCertFile)
+          	}
+
+          	certPEM, err := os.ReadFile(caCertFile)
+          	if err != nil { return err }
+          	block, _ := pem.Decode(certPEM)
+          	caCert, err = x509.ParseCertificate(block.Bytes)
+          	if err != nil { return err }
+
+          	keyPEM, err := os.ReadFile(caKeyFile)
+          	if err != nil { return err }
+          	keyBlock, _ := pem.Decode(keyPEM)
+          	caKey, err = x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+          	if err != nil { return err }
+
+          	return nil
+          }
+
+          func getCertificate(host string) (*tls.Certificate, error) {
+          	certMutex.Lock()
+          	defer certMutex.Unlock()
+
+          	if cert, ok := certCache[host]; ok { return cert, nil }
+
+          	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+          	if err != nil { return nil, err }
+
+          	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+          	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+          	if err != nil { return nil, err }
+
+          	template := x509.Certificate{
+          		SerialNumber: serialNumber,
+          		Subject: pkix.Name{ CommonName: host },
+          		NotBefore: time.Now().Add(-5 * time.Minute),
+          		NotAfter: time.Now().Add(365 * 24 * time.Hour),
+          		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+          		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+          		DNSNames: []string{host},
+          	}
+
+          	certBytes, err := x509.CreateCertificate(rand.Reader, &template, caCert, &priv.PublicKey, caKey)
+          	if err != nil { return nil, err }
+
+          	cert := &tls.Certificate{
+          		Certificate: [][]byte{certBytes, caCert.Raw},
+          		PrivateKey: priv,
+          	}
+
+          	certCache[host] = cert
+          	return cert, nil
+          }
+
+          func handleConnection(clientConn net.Conn) {
+          	defer clientConn.Close()
+
+          	reader := bufio.NewReader(clientConn)
+          	req, err := reader.ReadString('\n')
+          	if err != nil { return }
+
+          	if !strings.HasPrefix(req, "CONNECT ") { return }
+
+          	parts := strings.Split(req, " ")
+          	if len(parts) < 2 { return }
+
+          	hostPort := parts[1]
+          	host, _, err := net.SplitHostPort(hostPort)
+          	if err != nil { return }
+
+          	if !isTarget(host) { return }
+
+          	fmt.Printf("REQ: %s\n", host)
+
+          	for {
+          		line, err := reader.ReadString('\n')
+          		if err != nil || line == "\r\n" { break }
+          	}
+
+          	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+          	cert, err := getCertificate(host)
+          	if err != nil {
+          		fmt.Printf("ERR %s: cert gen failed\n", host)
+          		return
+          	}
+
+          	tlsClientConn := tls.Server(clientConn, &tls.Config{
+          		Certificates: []tls.Certificate{*cert},
+          		NextProtos:   []string{"http/1.1"},
+          	})
+          	if err := tlsClientConn.Handshake(); err != nil {
+          		fmt.Printf("ERR %s: client TLS failed\n", host)
+          		return
+          	}
+
+          	var realIP, sni string
+          	if strings.Contains(host, "whatsapp") || strings.Contains(host, "fbcdn") || strings.Contains(host, "facebook") {
+          		realIP = whatsappIPs[time.Now().Unix()%int64(len(whatsappIPs))]
+          		sni = "v.whatsapp.net"
+          	} else {
+          		realIP = host
+          		sni = host
+          	}
+
+          	remoteConn, err := net.DialTimeout("tcp", realIP+":443", 10*time.Second)
+          	if err != nil {
+          		fmt.Printf("ERR %s: remote TCP failed\n", host)
+          		return
+          	}
+          	defer remoteConn.Close()
+
+          	remoteTLSConn := tls.Client(remoteConn, &tls.Config{
+          		InsecureSkipVerify: true,
+          		ServerName:         sni,
+          		NextProtos:         []string{"http/1.1"},
+          	})
+          	if err := remoteTLSConn.Handshake(); err != nil {
+          		fmt.Printf("ERR %s: remote TLS failed\n", host)
+          		return
+          	}
+
+          	fmt.Printf("OK: %s\n", host)
+
+          	var wg sync.WaitGroup
+          	wg.Add(2)
+          	go func() {
+          		defer wg.Done()
+          		io.Copy(remoteTLSConn, tlsClientConn)
+          		remoteTLSConn.CloseWrite()
+          	}()
+          	go func() {
+          		defer wg.Done()
+          		io.Copy(tlsClientConn, remoteTLSConn)
+          		tlsClientConn.CloseWrite()
+          	}()
+          	wg.Wait()
+          }
+
+          func main() {
+          	err := loadOrGenerateCA()
+          	if err != nil {
+          		fmt.Println("CA Error:", err)
+          		return
+          	}
+
+          	fmt.Println("=== Go MITM Proxy ===")
+          	fmt.Println("Listening on", listenAddr)
+
+          	listener, err := net.Listen("tcp", listenAddr)
+          	if err != nil {
+          		fmt.Println("Listen Error:", err)
+          		return
+          	}
+          	defer listener.Close()
+
+          	for {
+          		conn, err := listener.Accept()
+          		if err != nil { continue }
+          		go handleConnection(conn)
+          	}
+          }
+          EOF
+
+      - name: Build Go Binaries
         run: |
-          export PATH=$PATH:~/.local/bin
-          buildozer android debug
+          cd go_proxy
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o ../app/src/main/assets/proxy_arm64
+          CGO_ENABLED=0 GOOS=android GOARCH=arm GOARM=7 go build -o ../app/src/main/assets/proxy_arm
+
+      - name: Write Android Manifest
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Jaddo Proxy"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Write MainActivity.java
+        run: |
+          cat > app/src/main/java/com/jaddo/proxy/MainActivity.java << 'EOF'
+          package com.jaddo.proxy;
+
+          import android.os.Bundle;
+          import android.app.Activity;
+          import android.widget.TextView;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.view.View;
+          import android.os.Environment;
+          import java.io.*;
+
+          public class MainActivity extends Activity {
+              private Process process;
+              private TextView statusText;
+              private TextView logText;
+              private File filesDir;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  
+                  filesDir = getFilesDir();
+                  
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(50, 50, 50, 50);
+                  
+                  statusText = new TextView(this);
+                  statusText.setText("Status: Stopped");
+                  
+                  logText = new TextView(this);
+                  logText.setTextSize(10);
+                  logText.setPadding(0, 20, 0, 0);
+                  
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(logText);
+                  LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 500);
+                  scroll.setLayoutParams(params);
+                  
+                  Button btn = new Button(this);
+                  btn.setText("Start Proxy");
+                  btn.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) {
+                          if (process == null || !process.isAlive()) {
+                              startProxy();
+                          }
+                      }
+                  });
+
+                  layout.addView(statusText);
+                  layout.addView(btn);
+                  layout.addView(scroll);
+                  setContentView(layout);
+              }
+
+              private void startProxy() {
+                  try {
+                      String arch = System.getProperty("os.arch");
+                      String binaryName = "proxy_arm64";
+                      if (arch.contains("armv7") || arch.contains("arm")) {
+                          binaryName = "proxy_arm";
+                      }
+                      
+                      InputStream is = getAssets().open(binaryName);
+                      File outFile = new File(filesDir, "proxy");
+                      FileOutputStream fos = new FileOutputStream(outFile);
+                      byte[] buffer = new byte[8192];
+                      int length;
+                      while ((length = is.read(buffer)) > 0) {
+                          fos.write(buffer, 0, length);
+                      }
+                      fos.close();
+                      is.close();
+
+                      outFile.setExecutable(true);
+                      
+                      ProcessBuilder pb = new ProcessBuilder(outFile.getAbsolutePath());
+                      pb.directory(filesDir);
+                      pb.redirectErrorStream(true);
+                      process = pb.start();
+                      
+                      statusText.setText("Status: Running (Port 8444)");
+                      
+                      new Thread(new Runnable() {
+                          public void run() {
+                              try {
+                                  BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                                  String line;
+                                  while ((line = reader.readLine()) != null) {
+                                      final String l = line;
+                                      runOnUiThread(new Runnable() {
+                                          public void run() {
+                                              logText.append(l + "\n");
+                                          }
+                                      });
+                                  }
+                              } catch (Exception e) {}
+                          }
+                      }).start();
+                      
+                      new Thread(new Runnable() {
+                          public void run() {
+                              try {
+                                  Thread.sleep(2000);
+                                  File caFile = new File(filesDir, "cert.pem");
+                                  if (caFile.exists()) {
+                                      File extDir = getExternalFilesDir(null);
+                                      if (extDir != null) {
+                                          File dest = new File(extDir, "cert.pem");
+                                          FileInputStream fis = new FileInputStream(caFile);
+                                          FileOutputStream fosExt = new FileOutputStream(dest);
+                                          byte[] buf = new byte[1024];
+                                          int len;
+                                          while ((len = fis.read(buf)) > 0) {
+                                              fosExt.write(buf, 0, len);
+                                          }
+                                          fis.close();
+                                          fosExt.close();
+                                          final String path = dest.getAbsolutePath();
+                                          runOnUiThread(new Runnable() {
+                                              public void run() {
+                                                  logText.append("\n[!] CA Certificate saved to:\n" + path + "\nInstall it from Settings -> Security.\n");
+                                              }
+                                          });
+                                      }
+                                  }
+                              } catch (Exception e) {}
+                          }
+                      }).start();
+                      
+                  } catch (Exception e) {
+                      statusText.setText("Error: " + e.getMessage());
+                  }
+              }
+              
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  if (process != null) process.destroy();
+              }
+          }
+          EOF
+
+      - name: Write Gradle Files
+        run: |
+          cat > app/build.gradle << 'EOF'
+          apply plugin: 'com.android.application'
+          android {
+              namespace 'com.jaddo.proxy'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.jaddo.proxy"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+          
+          cat > settings.gradle << 'EOF'
+          include ':app'
+          rootProject.name = "JaddoProxy"
+          EOF
+          
+          cat > build.gradle << 'EOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.0'
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          gradle wrapper
+          ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: kivy-apk
-          path: bin/*.apk
+          name: JaddoProxy-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
